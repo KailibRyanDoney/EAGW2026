@@ -15,7 +15,10 @@ All outputs land under ``data/`` (gitignored for raw bulk files).
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import re
+import shutil
 import sys
 import tarfile
 import urllib.parse
@@ -57,86 +60,137 @@ def _download(url: str, dest: Path, overwrite: bool = False) -> Path:
     return dest
 
 
-def _gwosc_event_json(event: str) -> dict:
-    """Fetch GWOSC Event API JSON for a confident catalog event.
+GWOSC_CATALOGS = [
+    "GWTC-5.0",
+    "GWTC-4.0",
+    "GWTC-3-confident",
+    "GWTC-2.1-confident",
+    "GWTC-1-confident",
+]
 
-    Tries a short list of known catalog endpoints. Network access required.
+
+def _get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        return json.load(resp)
+
+
+def _gwosc_event_json(event: str) -> tuple[str, dict]:
+    """Return (full event name, GWOSC Event API record) for a confident catalog event.
+
+    Accepts full names (GW231123_135430) and short names (GW190521, GW231123).
     """
-    catalogs = [
-        "GWTC-5.0",
-        "GWTC-4.0",
-        "GWTC-3-confident",
-        "GWTC-2.1-confident",
-        "GWTC-1-confident",
-    ]
     last_err: Exception | None = None
-    for cat in catalogs:
-        # Event API accepts unversioned names and redirects to the latest version.
-        url = f"https://gwosc.org/eventapi/json/{cat}/{event}/"
+    # The Event API accepts unversioned names and redirects to the latest version.
+    for cat in GWOSC_CATALOGS:
         try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                payload = json.load(resp)
-            events = payload.get("events") or payload
-            if not events:
-                continue
-            # Payload is {"events": {"GW190521-vX": {...}}}
-            if isinstance(events, dict):
-                return next(iter(events.values()))
-            return events
+            events = _get_json(f"https://gwosc.org/eventapi/json/{cat}/{event}/")["events"]
         except Exception as exc:  # noqa: BLE001 — try next catalog
             last_err = exc
             continue
+        name, record = next(iter(events.items()))
+        return name.rsplit("-v", 1)[0], record
+    # O4 events are only listed under their full name, so search each catalog for EVENT_*.
+    for cat in GWOSC_CATALOGS:
+        try:
+            events = _get_json(f"https://gwosc.org/eventapi/json/{cat}/")["events"]
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            continue
+        matches = sorted({rec["commonName"] for rec in events.values() if rec["commonName"].startswith(f"{event}_")})
+        if len(matches) > 1:
+            raise RuntimeError(f"{event} is ambiguous in {cat}: {matches}. Pass the full name.")
+        if matches:
+            return _gwosc_event_json(matches[0])
     raise RuntimeError(f"Could not resolve {event} on GWOSC Event API") from last_err
 
 
-def _pick_urls(event_record: dict) -> dict[str, str]:
-    """Extract PE HDF5 and skymap FITS URLs from a GWOSC event record."""
-    out: dict[str, str] = {}
-    for key, val in event_record.items():
-        if not isinstance(val, str):
-            continue
-        low = key.lower()
-        if "hdf5" in low and val.startswith("http"):
-            out.setdefault("hdf5", val)
-        if ("skymap" in low or "fits" in low) and val.endswith(".fits") and val.startswith("http"):
-            out.setdefault("skymap", val)
-        if low in {"hdf5_url", "pesummary_hdf5_url"} and val.startswith("http"):
-            out["hdf5"] = val
-        if low in {"skymap_fits_url", "skymap_url"} and val.startswith("http"):
-            out["skymap"] = val
-    return out
+def _preferred_pe(record: dict) -> dict | None:
+    """Return the preferred PE entry of a GWOSC event record; its data_url is the PE data release."""
+    pe = [p for p in record.get("parameters", {}).values() if p.get("pipeline_type") == "pe" and p.get("data_url")]
+    preferred = [p for p in pe if p.get("is_preferred")]
+    return (preferred or pe or [None])[0]
+
+
+def _zenodo_skymap_tarball(data_url: str) -> tuple[str, str]:
+    """Find the archived sky-map tarball in the Zenodo record that holds a PE data release."""
+    record_id = re.search(r"/records/(\d+)/", data_url).group(1)
+    for f in _get_json(f"https://zenodo.org/api/records/{record_id}")["files"]:
+        if "skymaps" in f["key"].lower() and f["key"].endswith(".tar.gz"):
+            return f["key"], f"https://zenodo.org/records/{record_id}/files/{urllib.parse.quote(f['key'])}?download=1"
+    raise RuntimeError(f"No sky-map tarball in Zenodo record {record_id}")
+
+
+def _pick_skymap(paths: list[Path], waveform: str) -> Path:
+    """Prefer the sky map of the preferred PE waveform, then Mixed, then IMRPhenomXPHM."""
+    # GWOSC labels look like "C00:Mixed+XO4a"; file names carry only "Mixed+XO4a".
+    for key in (waveform.split(":")[-1], "Mixed", "IMRPhenomXPHM"):
+        token = re.compile(rf"(?<![A-Za-z0-9+]){re.escape(key)}(?![A-Za-z0-9+])")
+        hits = [p for p in paths if key and token.search(p.name)]
+        if hits:
+            return hits[0]
+    return paths[0]
 
 
 def fetch_pe_gwosc(events: list[str], overwrite: bool = False) -> list[Path]:
-    """Download official PE HDF5 files via GWOSC Event API links."""
+    """Download the preferred official PE data release for each event, as linked from GWOSC."""
     saved: list[Path] = []
     for event in events:
         print(f"[pe] {event}")
-        record = _gwosc_event_json(event)
-        urls = _pick_urls(record)
-        if "hdf5" not in urls:
-            # Fall back: print keys so users can see what GWOSC returned.
-            print(f"  WARNING: no hdf5 URL in GWOSC record; keys={sorted(record)}")
+        _, record = _gwosc_event_json(event)
+        pe = _preferred_pe(record)
+        if pe is None:
+            print("  WARNING: no PE data release linked from GWOSC for this event.")
             print("  Use Zenodo bulk PE releases instead (see docs/git-prep.md).")
             continue
+        print(f"  preferred PE: {pe.get('waveform_family')}")
         dest = PE_DIR / f"{event}_PEDataRelease.hdf5"
-        saved.append(_download(urls["hdf5"], dest, overwrite=overwrite))
+        saved.append(_download(pe["data_url"], dest, overwrite=overwrite))
     return saved
 
 
 def fetch_skymaps_gwosc(events: list[str], overwrite: bool = False) -> list[Path]:
-    """Download official PE sky-map FITS via GWOSC Event API links."""
+    """Save the official PE sky map of each event as data/skymaps/<event>_skymap.fits.
+
+    Sky maps ship as one tarball per catalog, in the same Zenodo record as the PE data
+    release. Only this event's FITS files are extracted from it.
+    """
     saved: list[Path] = []
     for event in events:
         print(f"[skymap] {event}")
-        record = _gwosc_event_json(event)
-        urls = _pick_urls(record)
-        if "skymap" not in urls:
-            print(f"  WARNING: no skymap FITS URL in GWOSC record; keys={sorted(record)}")
+        dest = SKY_DIR / f"{event}_skymap.fits"
+        if dest.exists() and not overwrite:
+            print(f"  exists, skip: {dest}")
+            saved.append(dest)
+            continue
+        full_name, record = _gwosc_event_json(event)
+        pe = _preferred_pe(record)
+        if pe is None:
+            print("  WARNING: no PE data release linked from GWOSC for this event.")
             print("  Use Zenodo archived skymap tarballs instead (see docs/git-prep.md).")
             continue
-        dest = SKY_DIR / f"{event}_skymap.fits"
-        saved.append(_download(urls["skymap"], dest, overwrite=overwrite))
+        # Reuse FITS files already extracted, e.g. by an earlier --bulk run.
+        # GWTC-2.1 ships plain .fits, GWTC-4.0 ships .fits.gz.
+        candidates = [p for p in sorted(SKY_DIR.rglob(f"*{full_name}*.fits*")) if p != dest]
+        if not candidates:
+            name, url = _zenodo_skymap_tarball(pe["data_url"])
+            tarball = _download(url, SKY_DIR / name)
+            extract_dir = SKY_DIR / name.removesuffix(".tar.gz")
+            print(f"  extracting {full_name} -> {extract_dir}")
+            with tarfile.open(tarball, "r:gz") as tar:
+                members = [m for m in tar.getmembers() if full_name in m.name and m.name.endswith((".fits", ".fits.gz"))]
+                tar.extractall(extract_dir, members=members, filter="data")
+            candidates = sorted(extract_dir.rglob(f"*{full_name}*.fits*"))
+        if not candidates:
+            print(f"  WARNING: no sky map for {full_name} in the archived tarball.")
+            continue
+        chosen = _pick_skymap(candidates, pe.get("waveform_family", ""))
+        print(f"  using {chosen.name}")
+        if chosen.suffix == ".gz":
+            with gzip.open(chosen, "rb") as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+        else:
+            shutil.copyfile(chosen, dest)
+        saved.append(dest)
     return saved
 
 
