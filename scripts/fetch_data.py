@@ -111,11 +111,18 @@ def _preferred_pe(record: dict) -> dict | None:
     return (preferred or pe or [None])[0]
 
 
-def _zenodo_skymap_tarball(data_url: str) -> tuple[str, str]:
-    """Find the archived sky-map tarball in the Zenodo record that holds a PE data release."""
-    record_id = re.search(r"/records/(\d+)/", data_url).group(1)
+def _skymap_tarball(pe: dict) -> tuple[str, str]:
+    """Return (file name, URL) of the archived sky-map tarball that goes with a PE data release."""
+    # GWTC-2.1 and GWTC-3 records link the tarball directly (GWTC-3 calls it PESkyLocalizations).
+    link = pe.get("links", {}).get("skymap", "")
+    match = re.search(r"/files/([^/]+\.tar\.gz)", link)
+    if match:
+        return urllib.parse.unquote(match.group(1)), link
+    # GWTC-4.0 records have no sky-map link, so look next to the PE file in its Zenodo record.
+    record_id = re.search(r"/records/(\d+)/", pe["data_url"]).group(1)
     for f in _get_json(f"https://zenodo.org/api/records/{record_id}")["files"]:
-        if "skymaps" in f["key"].lower() and f["key"].endswith(".tar.gz"):
+        key = f["key"].lower()
+        if ("skymap" in key or "skylocalization" in key) and key.endswith(".tar.gz"):
             return f["key"], f"https://zenodo.org/records/{record_id}/files/{urllib.parse.quote(f['key'])}?download=1"
     raise RuntimeError(f"No sky-map tarball in Zenodo record {record_id}")
 
@@ -172,7 +179,7 @@ def fetch_skymaps_gwosc(events: list[str], overwrite: bool = False) -> list[Path
         # GWTC-2.1 ships plain .fits, GWTC-4.0 ships .fits.gz.
         candidates = [p for p in sorted(SKY_DIR.rglob(f"*{full_name}*.fits*")) if p != dest]
         if not candidates:
-            name, url = _zenodo_skymap_tarball(pe["data_url"])
+            name, url = _skymap_tarball(pe)
             tarball = _download(url, SKY_DIR / name)
             extract_dir = SKY_DIR / name.removesuffix(".tar.gz")
             print(f"  extracting {full_name} -> {extract_dir}")
